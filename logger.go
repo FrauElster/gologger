@@ -3,6 +3,7 @@ package gologger
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 )
 
 var l *logger
@@ -118,4 +119,19 @@ func SetLevel(level slog.Level) {
 		return
 	}
 	l.level = level
+}
+
+func ParseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return slog.LevelInfo, fmt.Errorf("unknown log level %q", s)
+	}
 }

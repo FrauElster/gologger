@@ -1,8 +1,6 @@
 package gologger
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -23,7 +21,14 @@ func WithBatchWait(duration time.Duration) LokiOption {
 	return func(l *LokiNotifier) { l.batchWait = duration }
 }
 
-func WithLoki(lokiHost, server, job string, opts ...LokiOption) (Option, error) {
+// WithLoki sets up the logger to send logs to a loki instance
+// the context is used to check if the loki instance is reachable AND for the runtime
+// if the context is cancelled, the loki will stop sending logs
+// lokiHost is the host of the loki instance
+// server is the name of the server that sends the logs
+// job is the name of the job that sends the logs
+// returns an error if the loki instance is not reachable or if the server or job is not set
+func WithLoki(ctx context.Context, lokiHost, server, job string, opts ...LokiOption) (Option, error) {
 	if lokiHost == "" {
 		return nil, fmt.Errorf("lokiHost must be set")
 	}
@@ -34,7 +39,7 @@ func WithLoki(lokiHost, server, job string, opts ...LokiOption) (Option, error) 
 		return nil, fmt.Errorf("job must be set")
 	}
 
-	err := waitForLoki(context.Background(), lokiHost)
+	err := waitForLoki(ctx, lokiHost)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +100,7 @@ func WithLoki(lokiHost, server, job string, opts ...LokiOption) (Option, error) 
 			})
 		}
 
-		go loki.run()
+		go loki.run(ctx)
 	}, nil
 }
 
@@ -114,6 +119,24 @@ type logEntry struct {
 	AdditionalValues map[string]any `json:"additionalValues"`
 }
 
+func (e logEntry) MarshalJSON() ([]byte, error) {
+	// slog.Level warn is "WARN", Loki expects "WARNING"
+	level := e.Level.String()
+	if level == "WARN" {
+		level = "WARNING"
+	}
+
+	return json.Marshal(struct {
+		Level            string         `json:"level"`
+		Message          string         `json:"message"`
+		AdditionalValues map[string]any `json:"additionalValues"`
+	}{
+		Level:            level,
+		Message:          e.Message,
+		AdditionalValues: e.AdditionalValues,
+	})
+}
+
 type LokiNotifier struct {
 	lokiHost   string
 	baseLabels map[string]string
@@ -123,32 +146,41 @@ type LokiNotifier struct {
 	batch     chan logEntry
 }
 
-func (l *LokiNotifier) run() {
-	ticker := time.NewTicker(l.batchWait)
-
+func (l *LokiNotifier) run(ctx context.Context) {
 	currentBatch := make([]logEntry, 0)
+	sendLogs := func() {
+		if len(currentBatch) == 0 {
+			return
+		}
+
+		err := l.send(currentBatch)
+		if err != nil {
+			// we use std logger here because we don't want to create a loop
+			slog.Error("failed to send batch to loki", "lokiHost", l.lokiHost, "err", err)
+			for _, entry := range currentBatch {
+				if entry.AdditionalValues == nil {
+					entry.AdditionalValues = make(map[string]any)
+				}
+				entry.AdditionalValues["originalTimestamp"] = entry.Timestamp
+				slog.Log(context.Background(), entry.Level, entry.Message, mapAdditionalValues(entry.AdditionalValues)...)
+			}
+		}
+		clear(currentBatch)
+	}
+
+	ticker := time.NewTicker(l.batchWait)
+	defer ticker.Stop()
 	for {
 		select {
+		case <-ctx.Done():
+			// send remaining logs
+			sendLogs()
+			return
 		case newMessage := <-l.batch:
 			currentBatch = append(currentBatch, newMessage)
 			continue
 		case <-ticker.C:
-			if len(currentBatch) == 0 {
-				continue
-			}
-
-			err := l.send(currentBatch)
-			if err != nil {
-				slog.Error("failed to send batch to loki", "lokiHost", l.lokiHost, "err", err)
-				for _, entry := range currentBatch {
-					if entry.AdditionalValues == nil {
-						entry.AdditionalValues = make(map[string]any)
-					}
-					entry.AdditionalValues["originalTimestamp"] = entry.Timestamp
-					slog.Log(context.Background(), entry.Level, entry.Message, mapAdditionalValues(entry.AdditionalValues)...)
-				}
-			}
-			clear(currentBatch)
+			sendLogs()
 		}
 	}
 }
@@ -191,8 +223,7 @@ func (l *LokiNotifier) send(batch []logEntry) error {
 	req.Header.Set("Content-Type", "application/json")
 
 	// send it to the loki host
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("could not send batch: %w", err)
 	}
@@ -251,34 +282,4 @@ func formatDuration(d time.Duration) string {
 	}
 
 	return strings.Join(parts, ":")
-}
-
-func zip(data []byte) (*bytes.Buffer, error) {
-	buf := new(bytes.Buffer)
-	gz := gzip.NewWriter(buf)
-
-	_, err := gz.Write(data)
-	if err != nil {
-		return buf, fmt.Errorf("could not compress data: %w", err)
-	}
-
-	err = gz.Close()
-	if err != nil {
-		return buf, fmt.Errorf("could not close compression writer: %w", err)
-	}
-
-	return buf, nil
-}
-
-func joinUrl(elements ...string) string {
-	for idx, element := range elements {
-		if idx > 0 {
-			element = strings.TrimPrefix(element, "/")
-		}
-		if idx < len(elements)-1 {
-			element = strings.TrimSuffix(element, "/")
-		}
-		elements[idx] = element
-	}
-	return strings.Join(elements, "/")
 }
