@@ -60,7 +60,7 @@ func WithLoki(ctx context.Context, lokiHost, server, job string, opts ...LokiOpt
 		}
 
 		if sliceContains(loki.levels, slog.LevelDebug) {
-			OnDebug(func(msg string, additionalValues map[string]any) {
+			l.onDebug = append(l.onDebug, func(msg string, additionalValues map[string]any) {
 				loki.batch <- logEntry{
 					Level:            slog.LevelInfo,
 					Timestamp:        time.Now(),
@@ -70,7 +70,7 @@ func WithLoki(ctx context.Context, lokiHost, server, job string, opts ...LokiOpt
 			})
 		}
 		if sliceContains(loki.levels, slog.LevelInfo) {
-			OnInfo(func(msg string, additionalValues map[string]any) {
+			l.onInfo = append(l.onInfo, func(msg string, additionalValues map[string]any) {
 				loki.batch <- logEntry{
 					Level:            slog.LevelInfo,
 					Timestamp:        time.Now(),
@@ -80,7 +80,7 @@ func WithLoki(ctx context.Context, lokiHost, server, job string, opts ...LokiOpt
 			})
 		}
 		if sliceContains(loki.levels, slog.LevelWarn) {
-			OnWarn(func(msg string, additionalValues map[string]any) {
+			l.onWarn = append(l.onWarn, func(msg string, additionalValues map[string]any) {
 				loki.batch <- logEntry{
 					Level:            slog.LevelWarn,
 					Timestamp:        time.Now(),
@@ -90,7 +90,7 @@ func WithLoki(ctx context.Context, lokiHost, server, job string, opts ...LokiOpt
 			})
 		}
 		if sliceContains(loki.levels, slog.LevelError) {
-			OnErr(func(msg string, additionalValues map[string]any) {
+			l.onErr = append(l.onErr, func(msg string, additionalValues map[string]any) {
 				loki.batch <- logEntry{
 					Level:            slog.LevelError,
 					Timestamp:        time.Now(),
@@ -165,7 +165,7 @@ func (l *LokiNotifier) run(ctx context.Context) {
 				slog.Log(context.Background(), entry.Level, entry.Message, mapAdditionalValues(entry.AdditionalValues)...)
 			}
 		}
-		clear(currentBatch)
+		currentBatch = make([]logEntry, 0)
 	}
 
 	ticker := time.NewTicker(l.batchWait)
@@ -241,7 +241,7 @@ func (l *LokiNotifier) send(batch []logEntry) error {
 func waitForLoki(ctx context.Context, lokiHost string) error {
 	attempts := 0
 	for {
-		if attempts > 5 {
+		if attempts > 1 {
 			return fmt.Errorf("could not connect to loki")
 		}
 		res, err := http.Get(joinUrl(lokiHost, "/ready"))

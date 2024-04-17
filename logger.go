@@ -121,6 +121,7 @@ func SetLevel(level slog.Level) {
 	l.level = level
 }
 
+// ParseLogLevel parses a string into a slog.Level
 func ParseLogLevel(s string) (slog.Level, error) {
 	switch strings.ToLower(s) {
 	case "debug":
@@ -135,3 +136,14 @@ func ParseLogLevel(s string) (slog.Level, error) {
 		return slog.LevelInfo, fmt.Errorf("unknown log level %q", s)
 	}
 }
+
+// MustParseLogLevel is like ParseLogLevel but panics if the input is invalid
+func MustParseLogLevel(s string) slog.Level {
+	level, err := ParseLogLevel(s)
+	if err != nil {
+		panic(err)
+	}
+	return level
+}
+
+func IsInitialized() bool { return l != nil }
