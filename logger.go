@@ -4,146 +4,112 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 )
 
-var l *logger
+// LogCallback is the function signature for log event subscribers
+type LogCallback func(msg string, args ...any)
 
-type logger struct {
-	level slog.Level
-
-	onDebug []Callback
-	onInfo  []Callback
-	onWarn  []Callback
-	onErr   []Callback
+// Logger represents the global logger instance
+type Logger struct {
+	mu        sync.RWMutex
+	level     slog.Level
+	callbacks map[slog.Level][]LogCallback
 }
 
-type Callback func(msg string, additionalValues map[string]any)
+var defaultLogger = &Logger{
+	level:     slog.LevelInfo, // Default to INFO level
+	callbacks: make(map[slog.Level][]LogCallback),
+}
 
-type Option func(*logger)
-
-func Init(level slog.Level, options ...Option) error {
-	l = &logger{
-		level:   level,
-		onDebug: make([]Callback, 0),
-		onInfo:  make([]Callback, 0),
-		onWarn:  make([]Callback, 0),
-		onErr:   make([]Callback, 0),
+// Setup configures the default logger with slog handlers based on the given level string
+func Setup(levelStr string) error {
+	var logLvl slog.Level
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		logLvl = slog.LevelDebug
+	case "info":
+		logLvl = slog.LevelInfo
+	case "warn":
+		logLvl = slog.LevelWarn
+	case "error":
+		logLvl = slog.LevelError
+	default:
+		return fmt.Errorf("unknown log level %q", levelStr)
 	}
+	SetLevel(logLvl)
 
-	for _, option := range options {
-		option(l)
-	}
-
-	// always enable console logs
-	addSlogCallbacks()
+	// Setup default slog handlers
+	RegisterCallback(slog.LevelDebug, slog.Debug)
+	RegisterCallback(slog.LevelInfo, slog.Info)
+	RegisterCallback(slog.LevelWarn, slog.Warn)
+	RegisterCallback(slog.LevelError, slog.Error)
 
 	return nil
 }
 
-func ApplyOptions(options ...Option) error {
-	if l == nil {
-		return fmt.Errorf("logger not initialized")
-	}
-
-	for _, option := range options {
-		option(l)
-	}
-	return nil
-}
-
-func OnDebug(callback Callback) {
-	l.onDebug = append(l.onDebug, callback)
-}
-
-func OnInfo(callback Callback) {
-	l.onInfo = append(l.onInfo, callback)
-}
-
-func OnWarn(callback Callback) {
-	l.onWarn = append(l.onWarn, callback)
-}
-
-func OnErr(callback Callback) {
-	l.onErr = append(l.onErr, callback)
-}
-
-func Log(level slog.Level, message string, additionaValues map[string]any) {
-	if l == nil {
-		slog.Error("Logger not initialized")
-		return
-	}
-
-	if level < l.level {
-		return
-	}
-
-	switch level {
-	case slog.LevelDebug:
-		for _, callback := range l.onDebug {
-			callback(message, additionaValues)
-		}
-	case slog.LevelInfo:
-		for _, callback := range l.onInfo {
-			callback(message, additionaValues)
-		}
-	case slog.LevelWarn:
-		for _, callback := range l.onWarn {
-			callback(message, additionaValues)
-		}
-	case slog.LevelError:
-		for _, callback := range l.onErr {
-			callback(message, additionaValues)
-		}
-	}
-}
-
-func Debug(message string, additionaValues map[string]any) {
-	Log(slog.LevelDebug, message, additionaValues)
-}
-
-func Info(message string, additionaValues map[string]any) {
-	Log(slog.LevelInfo, message, additionaValues)
-}
-
-func Warn(message string, additionaValues map[string]any) {
-	Log(slog.LevelWarn, message, additionaValues)
-}
-
-func Error(message string, additionaValues map[string]any) {
-	Log(slog.LevelError, message, additionaValues)
+// GetLevel returns the current logging level
+func GetLevel() slog.Level {
+	defaultLogger.mu.RLock()
+	defer defaultLogger.mu.RUnlock()
+	return defaultLogger.level
 }
 
 func SetLevel(level slog.Level) {
-	if l == nil {
-		slog.Error("Logger not initialized")
+	defaultLogger.mu.Lock()
+	defaultLogger.level = level
+	defaultLogger.mu.Unlock()
+}
+
+// log is a private helper function that handles the common logging logic
+func (l *Logger) log(level slog.Level, msg string, args ...any) {
+	l.mu.RLock()
+	if l.level > level {
+		l.mu.RUnlock()
 		return
 	}
-	l.level = level
-}
+	// Make a copy of callbacks to avoid holding the lock while executing them
+	callbacks := make([]LogCallback, len(l.callbacks[level]))
+	copy(callbacks, l.callbacks[level])
+	l.mu.RUnlock()
 
-// ParseLogLevel parses a string into a slog.Level
-func ParseLogLevel(s string) (slog.Level, error) {
-	switch strings.ToLower(s) {
-	case "debug":
-		return slog.LevelDebug, nil
-	case "info":
-		return slog.LevelInfo, nil
-	case "warn":
-		return slog.LevelWarn, nil
-	case "error":
-		return slog.LevelError, nil
-	default:
-		return slog.LevelInfo, fmt.Errorf("unknown log level %q", s)
+	for _, cb := range callbacks {
+		cb(msg, args...)
 	}
 }
 
-// MustParseLogLevel is like ParseLogLevel but panics if the input is invalid
-func MustParseLogLevel(s string) slog.Level {
-	level, err := ParseLogLevel(s)
-	if err != nil {
-		panic(err)
-	}
-	return level
+// Debug logs a debug message with the given arguments
+func Debug(msg string, args ...any) { defaultLogger.log(slog.LevelDebug, msg, args...) }
+
+// Info logs an info message with the given arguments
+func Info(msg string, args ...any) { defaultLogger.log(slog.LevelInfo, msg, args...) }
+
+// Warn logs a warning message with the given arguments
+func Warn(msg string, args ...any) { defaultLogger.log(slog.LevelWarn, msg, args...) }
+
+// Error logs an error message with the given arguments
+func Error(msg string, args ...any) { defaultLogger.log(slog.LevelError, msg, args...) }
+
+// RegisterCallback registers a callback function for the specified level
+func RegisterCallback(level slog.Level, cb LogCallback) {
+	defaultLogger.mu.Lock()
+	defer defaultLogger.mu.Unlock()
+	defaultLogger.callbacks[level] = append(defaultLogger.callbacks[level], cb)
 }
 
-func IsInitialized() bool { return l != nil }
+// Convenience functions for backward compatibility
+func OnDebug(cb LogCallback) {
+	RegisterCallback(slog.LevelDebug, cb)
+}
+
+func OnInfo(cb LogCallback) {
+	RegisterCallback(slog.LevelInfo, cb)
+}
+
+func OnWarn(cb LogCallback) {
+	RegisterCallback(slog.LevelWarn, cb)
+}
+
+func OnError(cb LogCallback) {
+	RegisterCallback(slog.LevelError, cb)
+}

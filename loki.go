@@ -1,285 +1,211 @@
 package gologger
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
-	"strings"
+	"sync"
 	"time"
 )
 
-type LokiOption func(loki *LokiNotifier)
-
-func WithLevels(levels []slog.Level) LokiOption {
-	return func(l *LokiNotifier) { l.levels = levels }
-}
-func WithBatchWait(duration time.Duration) LokiOption {
-	return func(l *LokiNotifier) { l.batchWait = duration }
-}
-
-// WithLoki sets up the logger to send logs to a loki instance
-// the context is used to check if the loki instance is reachable AND for the runtime
-// if the context is cancelled, the loki will stop sending logs
-// lokiHost is the host of the loki instance
-// server is the name of the server that sends the logs
-// job is the name of the job that sends the logs
-// returns an error if the loki instance is not reachable or if the server or job is not set
-func WithLoki(ctx context.Context, lokiHost, server, job string, opts ...LokiOption) (Option, error) {
-	if lokiHost == "" {
-		return nil, fmt.Errorf("lokiHost must be set")
-	}
-	if server == "" {
-		return nil, fmt.Errorf("server must be set")
-	}
-	if job == "" {
-		return nil, fmt.Errorf("job must be set")
-	}
-
-	err := waitForLoki(ctx, lokiHost)
-	if err != nil {
-		return nil, err
-	}
-
-	return func(l *logger) {
-		labels := map[string]string{"source": server, "job": job}
-
-		loki := LokiNotifier{
-			baseLabels: labels,
-			lokiHost:   lokiHost,
-			levels:     []slog.Level{slog.LevelError, slog.LevelInfo},
-			batchWait:  5 * time.Second,
-			batch:      make(chan logEntry),
-		}
-
-		for _, opt := range opts {
-			opt(&loki)
-		}
-
-		if sliceContains(loki.levels, slog.LevelDebug) {
-			l.onDebug = append(l.onDebug, func(msg string, additionalValues map[string]any) {
-				loki.batch <- logEntry{
-					Level:            slog.LevelInfo,
-					Timestamp:        time.Now(),
-					Message:          msg,
-					AdditionalValues: formatAdditionalValues(additionalValues),
-				}
-			})
-		}
-		if sliceContains(loki.levels, slog.LevelInfo) {
-			l.onInfo = append(l.onInfo, func(msg string, additionalValues map[string]any) {
-				loki.batch <- logEntry{
-					Level:            slog.LevelInfo,
-					Timestamp:        time.Now(),
-					Message:          msg,
-					AdditionalValues: formatAdditionalValues(additionalValues),
-				}
-			})
-		}
-		if sliceContains(loki.levels, slog.LevelWarn) {
-			l.onWarn = append(l.onWarn, func(msg string, additionalValues map[string]any) {
-				loki.batch <- logEntry{
-					Level:            slog.LevelWarn,
-					Timestamp:        time.Now(),
-					Message:          msg,
-					AdditionalValues: formatAdditionalValues(additionalValues),
-				}
-			})
-		}
-		if sliceContains(loki.levels, slog.LevelError) {
-			l.onErr = append(l.onErr, func(msg string, additionalValues map[string]any) {
-				loki.batch <- logEntry{
-					Level:            slog.LevelError,
-					Timestamp:        time.Now(),
-					Message:          msg,
-					AdditionalValues: formatAdditionalValues(additionalValues),
-				}
-			})
-		}
-
-		go loki.run(ctx)
-	}, nil
+type LokiConfig struct {
+	URL       string            // Loki server URL
+	BatchWait time.Duration     // Maximum amount of time to wait before sending a batch
+	Labels    map[string]string // Default labels to add to all logs
+	Tenant    string            // Optional tenant ID for multi-tenancy
 }
 
 type lokiStream struct {
 	Stream map[string]string `json:"stream"`
-	Values [][]string        ` json:"values"`
+	Values [][2]string       `json:"values"` // [timestamp, message]
 }
-type lokiMessage struct {
+
+type lokiBatch struct {
 	Streams []lokiStream `json:"streams"`
 }
 
+type buffer struct {
+	entries []logEntry
+	mu      sync.Mutex
+}
+
 type logEntry struct {
-	Level            slog.Level     `json:"level"`
-	Timestamp        time.Time      `json:"-"`
-	Message          string         `json:"message"`
-	AdditionalValues map[string]any `json:"additionalValues"`
+	timestamp time.Time
+	level     slog.Level
+	msg       string
+	args      []any
 }
 
-func (e logEntry) MarshalJSON() ([]byte, error) {
-	// slog.Level warn is "WARN", Loki expects "WARNING"
-	level := e.Level.String()
-	if level == "WARN" {
-		level = "WARNING"
+var (
+	logBuffer *buffer
+	ticker    *time.Ticker
+	done      chan bool
+)
+
+// UseLoki sets up logging callbacks that send logs to a Loki instance
+func UseLoki(cfg LokiConfig) error {
+	if cfg.URL == "" {
+		return fmt.Errorf("Loki URL cannot be empty")
 	}
 
-	return json.Marshal(struct {
-		Level            string         `json:"level"`
-		Message          string         `json:"message"`
-		AdditionalValues map[string]any `json:"additionalValues"`
-	}{
-		Level:            level,
-		Message:          e.Message,
-		AdditionalValues: e.AdditionalValues,
-	})
-}
-
-type LokiNotifier struct {
-	lokiHost   string
-	baseLabels map[string]string
-	levels     []slog.Level
-
-	batchWait time.Duration
-	batch     chan logEntry
-}
-
-func (l *LokiNotifier) run(ctx context.Context) {
-	currentBatch := make([]logEntry, 0)
-	sendLogs := func() {
-		if len(currentBatch) == 0 {
-			return
-		}
-
-		err := l.send(currentBatch)
-		if err != nil {
-			// we use std logger here because we don't want to create a loop
-			slog.Error("failed to send batch to loki", "lokiHost", l.lokiHost, "err", err)
-			for _, entry := range currentBatch {
-				if entry.AdditionalValues == nil {
-					entry.AdditionalValues = make(map[string]any)
-				}
-				entry.AdditionalValues["originalTimestamp"] = entry.Timestamp
-				slog.Log(context.Background(), entry.Level, entry.Message, mapAdditionalValues(entry.AdditionalValues)...)
-			}
-		}
-		currentBatch = make([]logEntry, 0)
+	// Set default values if not provided
+	if cfg.BatchWait == 0 {
+		cfg.BatchWait = time.Second
+	}
+	if cfg.Labels == nil {
+		cfg.Labels = make(map[string]string)
 	}
 
-	ticker := time.NewTicker(l.batchWait)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			// send remaining logs
-			sendLogs()
-			return
-		case newMessage := <-l.batch:
-			currentBatch = append(currentBatch, newMessage)
-			continue
-		case <-ticker.C:
-			sendLogs()
-		}
-	}
-}
-
-func (l *LokiNotifier) send(batch []logEntry) error {
-	// first transform our messages into lokiExpected json message format (ref: https://grafana.com/docs/loki/latest/api/#push-log-entries-to-loki)
-	values := make([][]string, len(batch))
-	for idx, entry := range batch {
-		marshelled, err := json.Marshal(entry)
-		if err != nil {
-			return fmt.Errorf("could not marshal entry: %w", err)
-		}
-		values[idx] = []string{strconv.FormatInt(entry.Timestamp.UnixNano(), 10), string(marshelled)}
-	}
-	// copy base labels
-	labels := make(map[string]string)
-	for k, v := range l.baseLabels {
-		labels[k] = v
+	// Ensure we have some basic labels
+	if _, ok := cfg.Labels["source"]; !ok {
+		cfg.Labels["source"] = "application"
 	}
 
-	content, err := json.Marshal(lokiMessage{Streams: []lokiStream{
-		{Stream: labels, Values: values},
-	}})
-	if err != nil {
-		return fmt.Errorf("could not marshal batch: %w", err)
+	// Initialize buffer and control channels
+	logBuffer = &buffer{
+		entries: make([]logEntry, 0),
 	}
+	done = make(chan bool)
+	ticker = time.NewTicker(cfg.BatchWait)
 
-	// compress it
-	compressed, err := zip(content)
-	if err != nil {
-		return fmt.Errorf("could not compress batch: %w", err)
-	}
+	// Start batch processing
+	go processBatches(cfg)
 
-	// prepare request
-	req, err := http.NewRequest("POST", joinUrl(l.lokiHost, "/loki/api/v1/push"), compressed)
-	if err != nil {
-		return fmt.Errorf("could not create request: %w", err)
-	}
-	req.Header.Set("Content-Encoding", "gzip")
-	req.Header.Set("Content-Type", "application/json")
-
-	// send it to the loki host
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("could not send batch: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// check for errors on loki
-	if resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("got error response from loki: %s - %s", resp.Status, string(body))
+	// Register callbacks for all levels
+	for _, level := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
+		level := level // Create new variable for closure
+		RegisterCallback(level, func(msg string, args ...any) {
+			logBuffer.mu.Lock()
+			logBuffer.entries = append(logBuffer.entries, logEntry{
+				timestamp: time.Now(),
+				level:     level,
+				msg:       msg,
+				args:      args,
+			})
+			logBuffer.mu.Unlock()
+		})
 	}
 
 	return nil
 }
 
-func waitForLoki(ctx context.Context, lokiHost string) error {
-	attempts := 0
-	for {
-		if attempts > 1 {
-			return fmt.Errorf("could not connect to loki")
-		}
-		res, err := http.Get(joinUrl(lokiHost, "/ready"))
-		if err != nil {
-			attempts += 1
-			continue
-		}
-		defer res.Body.Close()
-
-		if res.StatusCode != 200 {
-			attempts += 1
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		return nil
+// StopLoki gracefully shuts down the Loki integration
+func StopLoki() {
+	if ticker != nil {
+		ticker.Stop()
+		done <- true
 	}
 }
 
-func formatDuration(d time.Duration) string {
-	// Custom formatting can go here
-	// This is a simple example:
-	hours := d / time.Hour
-	d -= hours * time.Hour
-	minutes := d / time.Minute
-	d -= minutes * time.Minute
-	seconds := d / time.Second
+func processBatches(cfg LokiConfig) {
+	client := &http.Client{Timeout: 5 * time.Second}
 
-	parts := make([]string, 0)
-	if hours > 0 {
-		parts = append(parts, fmt.Sprintf("%dh", hours))
+	for {
+		select {
+		case <-ticker.C:
+			sendBatch(client, cfg)
+		case <-done:
+			// Send any remaining logs before shutting down
+			sendBatch(client, cfg)
+			return
+		}
 	}
-	if minutes > 0 {
-		parts = append(parts, fmt.Sprintf("%dm", minutes))
-	}
-	if seconds > 0 {
-		parts = append(parts, fmt.Sprintf("%ds", seconds))
+}
+
+func sendBatch(client *http.Client, cfg LokiConfig) {
+	logBuffer.mu.Lock()
+	if len(logBuffer.entries) == 0 {
+		logBuffer.mu.Unlock()
+		return
 	}
 
-	return strings.Join(parts, ":")
+	// Take current entries and reset the buffer
+	entries := logBuffer.entries
+	logBuffer.entries = make([]logEntry, 0)
+	logBuffer.mu.Unlock()
+
+	// Group entries by level
+	streamsByLevel := make(map[slog.Level][][2]string)
+	for _, entry := range entries {
+		// Format message with args
+		var fields string
+		for i := 0; i < len(entry.args); i += 2 {
+			if i+1 < len(entry.args) {
+				fields += fmt.Sprintf(" %v=%v", entry.args[i], entry.args[i+1])
+			}
+		}
+		message := fmt.Sprintf("%s%s", entry.msg, fields)
+
+		// Create timestamp in nanosecond precision
+		timestamp := fmt.Sprintf("%d", entry.timestamp.UnixNano())
+
+		streamsByLevel[entry.level] = append(streamsByLevel[entry.level], [2]string{timestamp, message})
+	}
+
+	// Create batch payload
+	batch := lokiBatch{
+		Streams: make([]lokiStream, 0, len(streamsByLevel)),
+	}
+
+	// Create a stream for each level
+	for level, values := range streamsByLevel {
+		labels := make(map[string]string)
+		for k, v := range cfg.Labels {
+			labels[k] = v
+		}
+		labels["level"] = levelToString(level)
+
+		batch.Streams = append(batch.Streams, lokiStream{
+			Stream: labels,
+			Values: values,
+		})
+	}
+
+	// Send to Loki
+	payload, err := json.Marshal(batch)
+	if err != nil {
+		slog.Error("Failed to marshal Loki batch", "error", err)
+		return
+	}
+
+	req, err := http.NewRequest("POST", cfg.URL+"/loki/api/v1/push", bytes.NewBuffer(payload))
+	if err != nil {
+		slog.Error("Failed to create Loki request", "error", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if cfg.Tenant != "" {
+		req.Header.Set("X-Scope-OrgID", cfg.Tenant)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.Error("Failed to send logs to Loki", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		slog.Error("Unexpected response from Loki",
+			"statusCode", resp.StatusCode,
+			"status", resp.Status)
+	}
+}
+
+func levelToString(level slog.Level) string {
+	switch level {
+	case slog.LevelDebug:
+		return "debug"
+	case slog.LevelInfo:
+		return "info"
+	case slog.LevelWarn:
+		return "warn"
+	case slog.LevelError:
+		return "error"
+	default:
+		return "unknown"
+	}
 }

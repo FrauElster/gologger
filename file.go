@@ -1,96 +1,168 @@
 package gologger
 
 import (
-	"bufio"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 )
 
-type fileLogger struct {
-	file   string
-	levels []slog.Level
+type FileConfig struct {
+	Path       string            // Path to the log file
+	TimeFormat string            // Format for timestamps, defaults to time.RFC3339
+	FormatJson bool              // Whether to format logs as JSON
+	LabelsMap  map[string]string // Labels to be included with every log entry
 }
 
-type FileLoggerOption func(*fileLogger)
-
-func WithFile(filepath string, opts ...FileLoggerOption) (Option, error) {
-	if filepath == "" {
-		return nil, fmt.Errorf("no filename specified")
-	}
-
-	if !canWriteToFile(filepath) {
-		return nil, fmt.Errorf("%s cannot be accessed", filepath)
-	}
-
-	return func(l *logger) {
-		logger := fileLogger{
-			file:   filepath,
-			levels: []slog.Level{slog.LevelError, slog.LevelInfo},
-		}
-		for _, opt := range opts {
-			opt(&logger)
-		}
-
-		if sliceContains(logger.levels, slog.LevelDebug) {
-			OnDebug(func(msg string, additionalValues map[string]any) {
-				line := fmt.Sprintf("%s | %s | %s | %s", time.Now(), "DEBUG", msg, formatAdditionalValues(additionalValues))
-				appendLineToFile(logger.file, line)
-			})
-		}
-		if sliceContains(logger.levels, slog.LevelInfo) {
-			OnInfo(func(msg string, additionalValues map[string]any) {
-				line := fmt.Sprintf("%s | %s | %s | %s", time.Now(), "INFO", msg, formatAdditionalValues(additionalValues))
-				appendLineToFile(logger.file, line)
-			})
-		}
-		if sliceContains(logger.levels, slog.LevelWarn) {
-			OnWarn(func(msg string, additionalValues map[string]any) {
-				line := fmt.Sprintf("%s | %s | %s | %s", time.Now(), "WARN", msg, formatAdditionalValues(additionalValues))
-				appendLineToFile(logger.file, line)
-			})
-		}
-		if sliceContains(logger.levels, slog.LevelError) {
-			OnErr(func(msg string, additionalValues map[string]any) {
-				line := fmt.Sprintf("%s | %s | %s | %s", time.Now(), "ERROR", msg, formatAdditionalValues(additionalValues))
-				appendLineToFile(logger.file, line)
-			})
-		}
-
-	}, nil
+type jsonLogEntry struct {
+	Time    string            `json:"time"`
+	Level   string            `json:"level"`
+	Labels  map[string]string `json:"labels,omitempty"`
+	Message string            `json:"message"`
+	Fields  map[string]any    `json:"fields,omitempty"`
 }
 
-// canWriteToFile checks if a file can be opened for writing.
-// If the file does not exist, it checks if it can be created.
-func canWriteToFile(filename string) bool {
-	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+var (
+	fileWriter *os.File
+	fileMu     sync.Mutex
+)
+
+// UseFile sets up logging callbacks that write logs to the specified file
+func UseFile(cfg FileConfig) error {
+	if cfg.Path == "" {
+		return fmt.Errorf("file path cannot be empty")
+	}
+
+	// Ensure directory exists
+	dir := filepath.Dir(cfg.Path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	// Open file in append mode, create if not exists
+	f, err := os.OpenFile(cfg.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return false
+		return fmt.Errorf("failed to open log file %s: %w", cfg.Path, err)
 	}
-	defer file.Close()
-	return true
+
+	fileWriter = f
+
+	if cfg.TimeFormat == "" {
+		cfg.TimeFormat = time.RFC3339
+	}
+
+	if cfg.LabelsMap == nil {
+		cfg.LabelsMap = make(map[string]string)
+	}
+
+	// Helper function to write a log entry to file
+	writeToFile := func(level slog.Level, msg string, args ...any) {
+		timestamp := time.Now().Format(cfg.TimeFormat)
+
+		var logLine string
+		if cfg.FormatJson {
+			// Create JSON entry
+			entry := jsonLogEntry{
+				Time:    timestamp,
+				Level:   levelToString(level),
+				Message: msg,
+			}
+
+			// Add labels if present
+			if len(cfg.LabelsMap) > 0 {
+				entry.Labels = cfg.LabelsMap
+			}
+
+			// Parse args into fields map
+			if len(args) > 0 {
+				fields := make(map[string]any)
+				for i := 0; i < len(args); i += 2 {
+					if i+1 < len(args) {
+						fields[fmt.Sprint(args[i])] = args[i+1]
+					}
+				}
+				if len(fields) > 0 {
+					entry.Fields = fields
+				}
+			}
+
+			// Marshal to JSON
+			jsonData, err := json.Marshal(entry)
+			if err != nil {
+				slog.Error("Failed to marshal log entry to JSON",
+					"error", err,
+					"message", msg,
+					"level", levelToString(level))
+				return
+			}
+			logLine = string(jsonData) + "\n"
+		} else {
+			// Format text entry with labels
+			var labels string
+			if len(cfg.LabelsMap) > 0 {
+				labelPairs := make([]string, 0, len(cfg.LabelsMap))
+				for k, v := range cfg.LabelsMap {
+					labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+				}
+				labels = fmt.Sprintf("[%s] ", strings.Join(labelPairs, " "))
+			}
+
+			// Format fields
+			var fields string
+			for i := 0; i < len(args); i += 2 {
+				if i+1 < len(args) {
+					fields += fmt.Sprintf(" %v=%v", args[i], args[i+1])
+				}
+			}
+
+			logLine = fmt.Sprintf("[%s] %s: %s%s%s\n",
+				timestamp,
+				levelToString(level),
+				labels,
+				msg,
+				fields,
+			)
+		}
+
+		// Write to file with mutex lock
+		fileMu.Lock()
+		if _, err := fileWriter.WriteString(logLine); err != nil {
+			// If file writing fails, log to stderr via slog
+			slog.Error("Failed to write to log file",
+				"error", err,
+				"message", msg,
+				"level", levelToString(level))
+		}
+		fileMu.Unlock()
+	}
+
+	// Register callbacks for all levels
+	RegisterCallback(slog.LevelDebug, func(msg string, args ...any) {
+		writeToFile(slog.LevelDebug, msg, args...)
+	})
+	RegisterCallback(slog.LevelInfo, func(msg string, args ...any) {
+		writeToFile(slog.LevelInfo, msg, args...)
+	})
+	RegisterCallback(slog.LevelWarn, func(msg string, args ...any) {
+		writeToFile(slog.LevelWarn, msg, args...)
+	})
+	RegisterCallback(slog.LevelError, func(msg string, args ...any) {
+		writeToFile(slog.LevelError, msg, args...)
+	})
+
+	return nil
 }
 
-func appendLineToFile(filename, line string) error {
-	// Open the file with flags to Append, Create if not exists, and Write only mode.
-	// 0666 specifies the file permissions when the file is created.
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		return fmt.Errorf("error opening file: %w", err)
+// StopFile closes the file writer
+func StopFile() error {
+	if fileWriter != nil {
+		fileMu.Lock()
+		defer fileMu.Unlock()
+		return fileWriter.Close()
 	}
-	defer file.Close()
-
-	writer := bufio.NewWriter(file)
-
-	if _, err := writer.WriteString(line + "\n"); err != nil {
-		return fmt.Errorf("error writing to file: %w", err)
-	}
-
-	// Flush any buffered data to the underlying file
-	if err := writer.Flush(); err != nil {
-		return fmt.Errorf("error flushing data to file: %w", err)
-	}
-
 	return nil
 }
