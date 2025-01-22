@@ -2,10 +2,12 @@ package gologger
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -170,13 +172,27 @@ func sendBatch(client *http.Client, cfg LokiConfig) {
 		return
 	}
 
-	req, err := http.NewRequest("POST", cfg.URL+"/loki/api/v1/push", bytes.NewBuffer(payload))
+	// Compress the payload
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(payload); err != nil {
+		slog.Error("Failed to compress payload", "error", err)
+		return
+	}
+	if err := gz.Close(); err != nil {
+		slog.Error("Failed to close gzip writer", "error", err)
+		return
+	}
+
+	url := strings.TrimRight(cfg.URL, "/") + "/loki/api/v1/push"
+	req, err := http.NewRequest("POST", url, &buf)
 	if err != nil {
 		slog.Error("Failed to create Loki request", "error", err)
 		return
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
 	if cfg.Tenant != "" {
 		req.Header.Set("X-Scope-OrgID", cfg.Tenant)
 	}
