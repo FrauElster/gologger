@@ -16,6 +16,7 @@ type FileConfig struct {
 	TimeFormat string            // Format for timestamps, defaults to time.RFC3339
 	FormatJson bool              // Whether to format logs as JSON
 	LabelsMap  map[string]string // Labels to be included with every log entry
+	MinLevel   *slog.Level       // Minimum log level to write to file
 }
 
 type jsonLogEntry struct {
@@ -140,19 +141,14 @@ func UseFile(cfg FileConfig) error {
 		fileMu.Unlock()
 	}
 
-	// Register callbacks for all levels
-	RegisterCallback(slog.LevelDebug, func(msg string, args ...any) {
-		writeToFile(slog.LevelDebug, msg, args...)
-	})
-	RegisterCallback(slog.LevelInfo, func(msg string, args ...any) {
-		writeToFile(slog.LevelInfo, msg, args...)
-	})
-	RegisterCallback(slog.LevelWarn, func(msg string, args ...any) {
-		writeToFile(slog.LevelWarn, msg, args...)
-	})
-	RegisterCallback(slog.LevelError, func(msg string, args ...any) {
-		writeToFile(slog.LevelError, msg, args...)
-	})
+	minLevel := slog.LevelDebug
+	if cfg.MinLevel != nil {
+		minLevel = *cfg.MinLevel
+	}
+	levelsToRegister := getLevelsAbove(minLevel)
+	for _, level := range levelsToRegister {
+		RegisterCallback(level, func(msg string, args ...any) { writeToFile(level, msg, args...) })
+	}
 
 	return nil
 }

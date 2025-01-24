@@ -17,25 +17,31 @@ type Logger struct {
 	callbacks map[slog.Level][]LogCallback
 }
 
-var defaultLogger = &Logger{
-	level:     slog.LevelInfo, // Default to INFO level
-	callbacks: make(map[slog.Level][]LogCallback),
+var (
+	defaultLogger = &Logger{level: slog.LevelInfo, callbacks: make(map[slog.Level][]LogCallback)}
+	levels        = []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError}
+)
+
+func ParseLevel(levelStr string) (slog.Level, error) {
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return slog.LevelInfo, fmt.Errorf("unknown log level %q", levelStr)
+	}
 }
 
 // Setup configures the default logger with slog handlers based on the given level string
 func Setup(levelStr string) error {
-	var logLvl slog.Level
-	switch strings.ToLower(levelStr) {
-	case "debug":
-		logLvl = slog.LevelDebug
-	case "info":
-		logLvl = slog.LevelInfo
-	case "warn":
-		logLvl = slog.LevelWarn
-	case "error":
-		logLvl = slog.LevelError
-	default:
-		return fmt.Errorf("unknown log level %q", levelStr)
+	logLvl, err := ParseLevel(levelStr)
+	if err != nil {
+		return err
 	}
 	SetLevel(logLvl)
 
@@ -112,4 +118,13 @@ func OnWarn(cb LogCallback) {
 
 func OnError(cb LogCallback) {
 	RegisterCallback(slog.LevelError, cb)
+}
+
+func getLevelsAbove(level slog.Level) []slog.Level {
+	for i, l := range levels {
+		if l == level {
+			return levels[i:]
+		}
+	}
+	return nil
 }

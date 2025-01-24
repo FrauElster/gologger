@@ -17,6 +17,7 @@ type LokiConfig struct {
 	BatchWait time.Duration     // Maximum amount of time to wait before sending a batch
 	Labels    map[string]string // Default labels to add to all logs
 	Tenant    string            // Optional tenant ID for multi-tenancy
+	MinLevel  *slog.Level       // Minimum log level to send to Loki
 }
 
 type lokiStream struct {
@@ -75,9 +76,12 @@ func UseLoki(cfg LokiConfig) error {
 	// Start batch processing
 	go processBatches(cfg)
 
-	// Register callbacks for all levels
-	for _, level := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
-		level := level // Create new variable for closure
+	minLevel := slog.LevelDebug
+	if cfg.MinLevel != nil {
+		minLevel = *cfg.MinLevel
+	}
+	levelsToRegister := getLevelsAbove(minLevel)
+	for _, level := range levelsToRegister {
 		RegisterCallback(level, func(msg string, args ...any) {
 			logBuffer.mu.Lock()
 			logBuffer.entries = append(logBuffer.entries, logEntry{

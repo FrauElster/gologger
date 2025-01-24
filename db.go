@@ -13,6 +13,7 @@ type DbConfig struct {
 	DB         *sql.DB
 	TimeFormat string
 	LabelsMap  map[string]string
+	MinLevel   *slog.Level
 }
 
 type dialectQueries struct {
@@ -157,19 +158,14 @@ func setupDbLogger(cfg DbConfig, dialect string) error {
 		}
 	}
 
-	// Register callbacks for all levels
-	RegisterCallback(slog.LevelDebug, func(msg string, args ...any) {
-		writeToDb(slog.LevelDebug, msg, args...)
-	})
-	RegisterCallback(slog.LevelInfo, func(msg string, args ...any) {
-		writeToDb(slog.LevelInfo, msg, args...)
-	})
-	RegisterCallback(slog.LevelWarn, func(msg string, args ...any) {
-		writeToDb(slog.LevelWarn, msg, args...)
-	})
-	RegisterCallback(slog.LevelError, func(msg string, args ...any) {
-		writeToDb(slog.LevelError, msg, args...)
-	})
+	minLevel := slog.LevelDebug
+	if cfg.MinLevel != nil {
+		minLevel = *cfg.MinLevel
+	}
+	levelsToRegister := getLevelsAbove(minLevel)
+	for _, level := range levelsToRegister {
+		RegisterCallback(level, func(msg string, args ...any) { writeToDb(level, msg, args...) })
+	}
 
 	return nil
 }
