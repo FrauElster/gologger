@@ -3,9 +3,13 @@ package gologger
 import (
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 )
+
+// StringConverter is a function that converts a value to its string representation
+type StringConverter func(v any) string
 
 // LogCallback is the function signature for log event subscribers
 type LogCallback func(msg string, args ...any)
@@ -15,13 +19,15 @@ type Logger struct {
 	mu        sync.RWMutex
 	level     slog.Level
 	callbacks map[slog.Level][]LogCallback
+	stringers map[reflect.Type]StringConverter
 }
 
 var (
-	defaultLogger = &Logger{level: slog.LevelInfo, callbacks: make(map[slog.Level][]LogCallback)}
+	defaultLogger = &Logger{level: slog.LevelInfo, callbacks: make(map[slog.Level][]LogCallback), stringers: make(map[reflect.Type]StringConverter)}
 	levels        = []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError}
 )
 
+// ParseLevel converts a string to a slog.Level
 func ParseLevel(levelStr string) (slog.Level, error) {
 	switch strings.ToLower(levelStr) {
 	case "debug":
@@ -35,6 +41,38 @@ func ParseLevel(levelStr string) (slog.Level, error) {
 	default:
 		return slog.LevelInfo, fmt.Errorf("unknown log level %q", levelStr)
 	}
+}
+
+// RegisterStringer registers a custom string conversion function for a specific type
+func RegisterStringer[T any](converter func(T) string) {
+	defaultLogger.mu.Lock()
+	defer defaultLogger.mu.Unlock()
+
+	// Create a zero value of T to get its type
+	var zero T
+	t := reflect.TypeOf(zero)
+
+	// Store the converter wrapped to handle interface{} input
+	defaultLogger.stringers[t] = func(v any) string {
+		if typed, ok := v.(T); ok {
+			return converter(typed)
+		}
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// GetLevel returns the current logging level
+func GetLevel() slog.Level {
+	defaultLogger.mu.RLock()
+	defer defaultLogger.mu.RUnlock()
+	return defaultLogger.level
+}
+
+// SetLevel sets the logging level
+func SetLevel(level slog.Level) {
+	defaultLogger.mu.Lock()
+	defaultLogger.level = level
+	defaultLogger.mu.Unlock()
 }
 
 // Setup configures the default logger with slog handlers based on the given level string
@@ -54,21 +92,46 @@ func Setup(levelStr string) error {
 	return nil
 }
 
-// GetLevel returns the current logging level
-func GetLevel() slog.Level {
-	defaultLogger.mu.RLock()
-	defer defaultLogger.mu.RUnlock()
-	return defaultLogger.level
-}
+// convertArgsToStrings applies registered string converters to args
+func (l *Logger) convertArgsToStrings(args ...any) []any {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
-func SetLevel(level slog.Level) {
-	defaultLogger.mu.Lock()
-	defaultLogger.level = level
-	defaultLogger.mu.Unlock()
+	converted := make([]any, len(args))
+	for i, arg := range args {
+		if v := reflect.ValueOf(arg); v.Kind() == reflect.Ptr && v.IsNil() {
+			converted[i] = nil
+			continue
+		}
+
+		t := reflect.TypeOf(arg)
+		if converter, ok := l.stringers[t]; ok {
+			converted[i] = converter(arg)
+		} else {
+			converted[i] = arg
+		}
+	}
+	return converted
 }
 
 // log is a private helper function that handles the common logging logic
 func (l *Logger) log(level slog.Level, msg string, args ...any) {
+	// Validate args are in key-value pairs
+	if len(args)%2 != 0 {
+		panic(fmt.Sprintf("invalid number of arguments to log call: got %d, expected even number of key-value pairs", len(args)))
+	}
+
+	// Validate keys are strings
+	for i := 0; i < len(args); i += 2 {
+		key, ok := args[i].(string)
+		if !ok {
+			panic(fmt.Sprintf("invalid key type at position %d: got %T, expected string", i, args[i]))
+		}
+		if key == "" {
+			panic(fmt.Sprintf("empty string key at position %d", i))
+		}
+	}
+
 	l.mu.RLock()
 	if l.level > level {
 		l.mu.RUnlock()
@@ -79,8 +142,11 @@ func (l *Logger) log(level slog.Level, msg string, args ...any) {
 	copy(callbacks, l.callbacks[level])
 	l.mu.RUnlock()
 
+	// convrt args with registered stringers
+	convertedArgs := l.convertArgsToStrings(args...)
+
 	for _, cb := range callbacks {
-		cb(msg, args...)
+		cb(msg, convertedArgs...)
 	}
 }
 

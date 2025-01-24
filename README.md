@@ -51,4 +51,8 @@ if db != nil {
 gologger.Info("not logged at all")
 gologger.Warn("written to stdout, file, and database, but not to loki", "key", "value")
 gologger.Error("sent to loki and stdout")
+
+// one can also register stringer functions, which are called for each log entry
+gologger.RegisterStringer(func(tm time.Time) string { return tm.Format("2006-01-02") })
+gologger.Warn("with timestamp formatting", "time", time.Now())
 ```
