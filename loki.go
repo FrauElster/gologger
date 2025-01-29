@@ -81,7 +81,8 @@ func UseLoki(cfg LokiConfig) error {
 		minLevel = *cfg.MinLevel
 	}
 	levelsToRegister := getLevelsAbove(minLevel)
-	for _, level := range levelsToRegister {
+	for idx := range levelsToRegister {
+		level := levelsToRegister[idx]
 		RegisterCallback(level, func(msg string, args ...any) {
 			logBuffer.mu.Lock()
 			logBuffer.entries = append(logBuffer.entries, logEntry{

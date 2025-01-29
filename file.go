@@ -146,7 +146,8 @@ func UseFile(cfg FileConfig) error {
 		minLevel = *cfg.MinLevel
 	}
 	levelsToRegister := getLevelsAbove(minLevel)
-	for _, level := range levelsToRegister {
+	for idx := range levelsToRegister {
+		level := levelsToRegister[idx]
 		RegisterCallback(level, func(msg string, args ...any) { writeToFile(level, msg, args...) })
 	}
 

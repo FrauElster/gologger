@@ -163,7 +163,8 @@ func setupDbLogger(cfg DbConfig, dialect string) error {
 		minLevel = *cfg.MinLevel
 	}
 	levelsToRegister := getLevelsAbove(minLevel)
-	for _, level := range levelsToRegister {
+	for idx := range levelsToRegister {
+		level := levelsToRegister[idx]
 		RegisterCallback(level, func(msg string, args ...any) { writeToDb(level, msg, args...) })
 	}
 
